@@ -131,6 +131,124 @@ def evaluate_overlap_area(X, Y, box_sizes_float, repeat_units, box_to_inst,
     return area_f, overlap_val
 
 # ==========================================
+# 1b. Incremental overlap primitives (optimization #1)
+# ==========================================
+@njit(fastmath=True)
+def full_box_overlap(X, Y, x2, y2, N):
+    ov = 0.0
+    for i in range(N):
+        xi1, xi2, yi1, yi2 = X[i], x2[i], Y[i], y2[i]
+        for j in range(i + 1, N):
+            ix1 = xi1 if xi1 > X[j] else X[j]
+            ix2 = xi2 if xi2 < x2[j] else x2[j]
+            ox = ix2 - ix1
+            if ox > 0.0:
+                iy1 = yi1 if yi1 > Y[j] else Y[j]
+                iy2 = yi2 if yi2 < y2[j] else y2[j]
+                oy = iy2 - iy1
+                if oy > 0.0:
+                    ov += ox * oy
+    return ov
+
+@njit(fastmath=True)
+def touch_box_overlap(X, Y, x2, y2, N, S, k, in_box):
+    """Overlap touching support set S (k active boxes in S[:k]), each pair counted
+    EXACTLY ONCE: (S vs non-S) + (within-S pairs). With identical S before/after a
+    move, box_ov + (new_touch - old_touch) is an EXACT total box-box overlap update."""
+    for a in range(k):
+        in_box[S[a]] = 1
+    ov = 0.0
+    for a in range(k):
+        i = S[a]
+        xi1, xi2, yi1, yi2 = X[i], x2[i], Y[i], y2[i]
+        for j in range(N):
+            if in_box[j]:
+                continue
+            ix1 = xi1 if xi1 > X[j] else X[j]
+            ix2 = xi2 if xi2 < x2[j] else x2[j]
+            ox = ix2 - ix1
+            if ox > 0.0:
+                iy1 = yi1 if yi1 > Y[j] else Y[j]
+                iy2 = yi2 if yi2 < y2[j] else y2[j]
+                oy = iy2 - iy1
+                if oy > 0.0:
+                    ov += ox * oy
+    for a in range(k):
+        i = S[a]
+        xi1, xi2, yi1, yi2 = X[i], x2[i], Y[i], y2[i]
+        for b in range(a + 1, k):
+            j = S[b]
+            ix1 = xi1 if xi1 > X[j] else X[j]
+            ix2 = xi2 if xi2 < x2[j] else x2[j]
+            ox = ix2 - ix1
+            if ox > 0.0:
+                iy1 = yi1 if yi1 > Y[j] else Y[j]
+                iy2 = yi2 if yi2 < y2[j] else y2[j]
+                oy = iy2 - iy1
+                if oy > 0.0:
+                    ov += ox * oy
+    for a in range(k):
+        in_box[S[a]] = 0
+    return ov
+
+@njit(fastmath=True)
+def inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                  inst_x1, inst_x2, inst_y1, inst_y2):
+    """Full instance overlap + area (kept full in v1: cheap O(N*num_inst))."""
+    N = X.shape[0]
+    overlap_val = 0.0
+    num_inst = repeat_units.shape[0]
+    if num_inst > 0:
+        for k in range(num_inst):
+            r0 = repeat_units[k][0]
+            min_x = X[r0]; max_x = x2[r0]
+            min_y = Y[r0]; max_y = y2[r0]
+            for m in range(1, repeat_units.shape[1]):
+                idx = repeat_units[k][m]
+                if idx == -1: break
+                if X[idx] < min_x: min_x = X[idx]
+                if x2[idx] > max_x: max_x = x2[idx]
+                if Y[idx] < min_y: min_y = Y[idx]
+                if y2[idx] > max_y: max_y = y2[idx]
+            inst_x1[k] = min_x; inst_x2[k] = max_x
+            inst_y1[k] = min_y; inst_y2[k] = max_y
+        for i in range(N):
+            idx_inst = box_to_inst[i]
+            xi1, xi2 = X[i], x2[i]
+            yi1, yi2 = Y[i], y2[i]
+            for k in range(num_inst):
+                if k == idx_inst: continue
+                ix1 = xi1 if xi1 > inst_x1[k] else inst_x1[k]
+                ix2 = xi2 if xi2 < inst_x2[k] else inst_x2[k]
+                ox = ix2 - ix1
+                if ox > 0.0:
+                    iy1 = yi1 if yi1 > inst_y1[k] else inst_y1[k]
+                    iy2 = yi2 if yi2 < inst_y2[k] else inst_y2[k]
+                    oy = iy2 - iy1
+                    if oy > 0.0:
+                        overlap_val += ox * oy
+        for k1 in range(num_inst):
+            for k2 in range(k1 + 1, num_inst):
+                ix1 = inst_x1[k1] if inst_x1[k1] > inst_x1[k2] else inst_x1[k2]
+                ix2 = inst_x2[k1] if inst_x2[k1] < inst_x2[k2] else inst_x2[k2]
+                ox = ix2 - ix1
+                if ox > 0.0:
+                    iy1 = inst_y1[k1] if inst_y1[k1] > inst_y1[k2] else inst_y1[k2]
+                    iy2 = inst_y2[k1] if inst_y2[k1] < inst_y2[k2] else inst_y2[k2]
+                    oy = iy2 - iy1
+                    if oy > 0.0:
+                        overlap_val += ox * oy * 5.0
+    gmin_x, gmax_x = X[0], x2[0]
+    gmin_y, gmax_y = Y[0], y2[0]
+    for i in range(1, N):
+        if X[i] < gmin_x: gmin_x = X[i]
+        if x2[i] > gmax_x: gmax_x = x2[i]
+        if Y[i] < gmin_y: gmin_y = Y[i]
+        if y2[i] > gmax_y: gmax_y = y2[i]
+    area_f = (gmax_x - gmin_x) * (gmax_y - gmin_y) * 1e-8
+    return area_f, overlap_val
+
+# ==========================================
 # 2. Stateful & Incremental SA Cores
 # ==========================================
 @njit
@@ -398,6 +516,357 @@ def run_integer_tuning_steps(X, Y, basis_x, basis_y, box_sizes_float, net_matrix
     return X, Y, best_X, best_Y, best_cost, best_overlap
 
 # ==========================================
+# 2b. Incremental-overlap SA / tuning cores (optimization #1 + #6)
+# Box-box overlap maintained incrementally via touch(); instance overlap + area
+# recomputed fully each step (cheap O(N*num_inst)). X/x2 updates are sparse over
+# the moved support. Behavior (move selection, accept rule, RNG) is identical to
+# the full-eval cores; only the eval math differs -> verified equivalent.
+# ==========================================
+@njit
+def run_sa_steps_float_incr(Z_x, Z_y, M_x, C_x, M_y, C_y, box_sizes_float, net_matrix,
+                            repeat_units, box_to_inst,
+                            v2b_x_idx, v2b_x_val, v2b_y_idx, v2b_y_val,
+                            box_to_nets_mat, box_to_zx, box_to_zy,
+                            x2, y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved, in_box,
+                            phase, T, base_step, rng_state, w_area, w_hpwl, steps,
+                            na_prob, na_mode, na_scr):
+    N = box_sizes_float.shape[0]
+    X = M_x @ Z_x + C_x
+    Y = M_y @ Z_y + C_y
+    penalty_weight = 1e6 if phase == 1 else 1e12
+    for i in range(N):
+        x2[i] = X[i] + box_sizes_float[i, 0]
+        y2[i] = Y[i] + box_sizes_float[i, 1]
+    box_ov = full_box_overlap(X, Y, x2, y2, N)
+    area_f, inst_ov = inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                                    scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+    current_overlap = box_ov + inst_ov
+    current_hpwl = compute_all_hpwl(X, Y, box_sizes_float, net_matrix)
+    current_cost = w_area * area_f + w_hpwl * current_hpwl + penalty_weight * (current_overlap * 1e-8)
+    current_box_ov = box_ov
+
+    best_Z_x = Z_x.copy(); best_Z_y = Z_y.copy()
+    best_cost = current_cost; best_overlap = current_overlap
+    len_x, len_y = len(Z_x), len(Z_y)
+    num_nets = net_matrix.shape[0]
+
+    for _ in range(steps):
+        idx_x, idx_y = -1, -1
+        delta = 0.0
+
+        is_net_aware = False
+        if num_nets > 0 and next_rand(rng_state) < na_prob:
+            net_idx = int(next_rand(rng_state) * num_nets)
+            nmin_x, nmax_x = 1e20, -1e20
+            nmin_y, nmax_y = 1e20, -1e20
+            bcnt = 0
+            for m in range(net_matrix.shape[1]):
+                b = net_matrix[net_idx][m]
+                if b == -1: break
+                bcnt += 1
+                cx = X[b] + box_sizes_float[b, 0] * 0.5
+                cy = Y[b] + box_sizes_float[b, 1] * 0.5
+                if cx < nmin_x: nmin_x = cx
+                if cx > nmax_x: nmax_x = cx
+                if cy < nmin_y: nmin_y = cy
+                if cy > nmax_y: nmax_y = cy
+            if bcnt > 1:
+                if na_mode == 1:
+                    # #3: move the SPAN-DEFINING extreme box toward the axis MEDIAN
+                    # (directly shrinks HPWL span, unlike a random interior member).
+                    use_x = (next_rand(rng_state) < 0.5)
+                    if (use_x and len_x > 0) or ((not use_x) and len_y > 0 and len_x == 0):
+                        ax = 0
+                    elif len_y > 0:
+                        ax = 1
+                    else:
+                        ax = 0 if len_x > 0 else 1
+                    for m in range(bcnt):
+                        b = net_matrix[net_idx][m]
+                        if ax == 0:
+                            na_scr[m] = X[b] + box_sizes_float[b, 0] * 0.5
+                        else:
+                            na_scr[m] = Y[b] + box_sizes_float[b, 1] * 0.5
+                    # insertion sort centers to get median
+                    for mm in range(1, bcnt):
+                        key = na_scr[mm]; kk = mm - 1
+                        while kk >= 0 and na_scr[kk] > key:
+                            na_scr[kk + 1] = na_scr[kk]; kk -= 1
+                        na_scr[kk + 1] = key
+                    median_v = na_scr[bcnt // 2]
+                    lo_v = na_scr[0]; hi_v = na_scr[bcnt - 1]
+                    pick_hi = next_rand(rng_state) < 0.5
+                    target_b = -1
+                    for m in range(bcnt):
+                        b = net_matrix[net_idx][m]
+                        cv = (X[b] + box_sizes_float[b, 0] * 0.5) if ax == 0 else (Y[b] + box_sizes_float[b, 1] * 0.5)
+                        if (pick_hi and cv == hi_v) or ((not pick_hi) and cv == lo_v):
+                            target_b = b; break
+                    if target_b != -1:
+                        if ax == 0:
+                            zx_idx = box_to_zx[target_b]
+                            if zx_idx != -1:
+                                idx_x = zx_idx
+                                cv = X[target_b] + box_sizes_float[target_b, 0] * 0.5
+                                coeff = M_x[target_b, zx_idx]
+                                if abs(coeff) > 1e-5 and abs(median_v - cv) > 1e-3:
+                                    delta = ((median_v - cv) / coeff) * next_rand(rng_state) * 1.2
+                                    is_net_aware = True
+                        else:
+                            zy_idx = box_to_zy[target_b]
+                            if zy_idx != -1:
+                                idx_y = zy_idx
+                                cv = Y[target_b] + box_sizes_float[target_b, 1] * 0.5
+                                coeff = M_y[target_b, zy_idx]
+                                if abs(coeff) > 1e-5 and abs(median_v - cv) > 1e-3:
+                                    delta = ((median_v - cv) / coeff) * next_rand(rng_state) * 1.2
+                                    is_net_aware = True
+                else:
+                    center_x = (nmin_x + nmax_x) * 0.5
+                    center_y = (nmin_y + nmax_y) * 0.5
+                    rand_m = int(next_rand(rng_state) * bcnt)
+                    target_b = net_matrix[net_idx][rand_m]
+                    if next_rand(rng_state) < 0.5 and len_x > 0:
+                        zx_idx = box_to_zx[target_b]
+                        if zx_idx != -1:
+                            idx_x = zx_idx
+                            dist = center_x - (X[target_b] + box_sizes_float[target_b, 0] * 0.5)
+                            coeff = M_x[target_b, zx_idx]
+                            if abs(coeff) > 1e-5:
+                                delta = (dist / coeff) * next_rand(rng_state) * 1.5
+                                is_net_aware = True
+                    elif len_y > 0:
+                        zy_idx = box_to_zy[target_b]
+                        if zy_idx != -1:
+                            idx_y = zy_idx
+                            dist = center_y - (Y[target_b] + box_sizes_float[target_b, 1] * 0.5)
+                        coeff = M_y[target_b, zy_idx]
+                        if abs(coeff) > 1e-5:
+                            delta = (dist / coeff) * next_rand(rng_state) * 1.5
+                            is_net_aware = True
+
+        if not is_net_aware:
+            r1 = next_rand(rng_state)
+            curr_step = base_step if r1 < 0.7 else base_step * 3.0
+            if len_x > 0 and len_y > 0:
+                if next_rand(rng_state) < 0.5:
+                    idx_x = int(next_rand(rng_state) * len_x)
+                    delta = -curr_step + next_rand(rng_state) * (2.0 * curr_step)
+                else:
+                    idx_y = int(next_rand(rng_state) * len_y)
+                    delta = -curr_step + next_rand(rng_state) * (2.0 * curr_step)
+            elif len_x > 0:
+                idx_x = int(next_rand(rng_state) * len_x)
+                delta = -curr_step + next_rand(rng_state) * (2.0 * curr_step)
+            elif len_y > 0:
+                idx_y = int(next_rand(rng_state) * len_y)
+                delta = -curr_step + next_rand(rng_state) * (2.0 * curr_step)
+            else: break
+
+        if idx_x != -1:
+            S = v2b_x_idx[idx_x]; Vrow = v2b_x_val[idx_x]
+        else:
+            S = v2b_y_idx[idx_y]; Vrow = v2b_y_val[idx_y]
+        k = 0
+        while k < S.shape[0] and S[k] != -1:
+            k += 1
+
+        net_moved[:] = False
+        old_partial_hpwl = 0.0
+        for a in range(k):
+            b = S[a]
+            for j in range(box_to_nets_mat.shape[1]):
+                nt = box_to_nets_mat[b, j]
+                if nt == -1: break
+                net_moved[nt] = True
+        for nt in range(num_nets):
+            if net_moved[nt]:
+                old_partial_hpwl += compute_single_net_hpwl(nt, X, Y, box_sizes_float, net_matrix)
+
+        old_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+
+        if idx_x != -1:
+            Z_x[idx_x] += delta
+            for a in range(k):
+                i = S[a]; X[i] += delta * Vrow[a]; x2[i] = X[i] + box_sizes_float[i, 0]
+        else:
+            Z_y[idx_y] += delta
+            for a in range(k):
+                i = S[a]; Y[i] += delta * Vrow[a]; y2[i] = Y[i] + box_sizes_float[i, 1]
+
+        new_partial_hpwl = 0.0
+        for nt in range(num_nets):
+            if net_moved[nt]:
+                new_partial_hpwl += compute_single_net_hpwl(nt, X, Y, box_sizes_float, net_matrix)
+        new_hpwl = current_hpwl + (new_partial_hpwl - old_partial_hpwl) * 5e-5
+
+        new_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+        new_box_ov = current_box_ov - old_touch + new_touch
+        area_new, inst_ov_new = inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                                              scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+        new_overlap = new_box_ov + inst_ov_new
+        new_cost = w_area * area_new + w_hpwl * new_hpwl + penalty_weight * (new_overlap * 1e-8)
+
+        accept = False
+        if phase == 1:
+            if new_overlap < current_overlap: accept = True
+            else:
+                dE = (new_cost - current_cost) / T
+                if dE < 70.0 and next_rand(rng_state) < np.exp(-dE): accept = True
+        else:
+            if new_overlap <= 0.0:
+                if current_overlap > 0.0 or new_cost < current_cost: accept = True
+                else:
+                    dE = (new_cost - current_cost) / T
+                    if dE < 70.0 and next_rand(rng_state) < np.exp(-dE): accept = True
+            else:
+                if new_overlap < current_overlap: accept = True
+                else:
+                    dE = (new_cost - current_cost) / T
+                    if dE < 70.0 and next_rand(rng_state) < np.exp(-dE): accept = True
+
+        if accept:
+            current_cost, current_overlap, current_hpwl = new_cost, new_overlap, new_hpwl
+            current_box_ov = new_box_ov
+            if phase == 1:
+                if current_overlap < best_overlap or (abs(current_overlap - best_overlap) < 1e-3 and current_cost < best_cost):
+                    best_overlap, best_cost = current_overlap, current_cost
+                    best_Z_x[:] = Z_x; best_Z_y[:] = Z_y
+            else:
+                if current_overlap <= 0.0 and (best_overlap > 0.0 or current_cost < best_cost):
+                    best_cost, best_overlap = current_cost, current_overlap
+                    best_Z_x[:] = Z_x; best_Z_y[:] = Z_y
+                elif best_overlap > 0.0 and current_overlap < best_overlap:
+                    best_cost, best_overlap = current_cost, current_overlap
+                    best_Z_x[:] = Z_x; best_Z_y[:] = Z_y
+        else:
+            if idx_x != -1:
+                Z_x[idx_x] -= delta
+                for a in range(k):
+                    i = S[a]; X[i] -= delta * Vrow[a]; x2[i] = X[i] + box_sizes_float[i, 0]
+            else:
+                Z_y[idx_y] -= delta
+                for a in range(k):
+                    i = S[a]; Y[i] -= delta * Vrow[a]; y2[i] = Y[i] + box_sizes_float[i, 1]
+
+    return Z_x, Z_y, best_Z_x, best_Z_y, best_cost, best_overlap
+
+@njit
+def run_integer_tuning_steps_incr(X, Y, basis_x, basis_y, box_sizes_float, net_matrix,
+                                  repeat_units, box_to_inst,
+                                  b2b_x_idx, b2b_x_val, b2b_y_idx, b2b_y_val, box_to_nets_mat,
+                                  x2, y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved, in_box,
+                                  rng_state, w_area, w_hpwl, T, steps):
+    N = box_sizes_float.shape[0]
+    penalty_weight = 1e12
+    for i in range(N):
+        x2[i] = X[i] + box_sizes_float[i, 0]
+        y2[i] = Y[i] + box_sizes_float[i, 1]
+    box_ov = full_box_overlap(X, Y, x2, y2, N)
+    area_f, inst_ov = inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                                    scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+    current_overlap = box_ov + inst_ov
+    current_hpwl = compute_all_hpwl(X, Y, box_sizes_float, net_matrix)
+    current_cost = w_area * area_f + w_hpwl * current_hpwl + penalty_weight * (current_overlap * 1e-8)
+    current_box_ov = box_ov
+
+    best_X = X.copy(); best_Y = Y.copy()
+    best_cost = current_cost; best_overlap = current_overlap
+    len_bx = b2b_x_idx.shape[0]
+    len_by = b2b_y_idx.shape[0]
+    num_nets = net_matrix.shape[0]
+
+    for _ in range(steps):
+        r_step = next_rand(rng_state)
+        mult = 1 if r_step < 0.7 else (2 if r_step < 0.9 else 3)
+        if next_rand(rng_state) < 0.5: mult = -mult
+
+        idx_x, idx_y = -1, -1
+        if len_bx > 0 and len_by > 0:
+            if next_rand(rng_state) < 0.5:
+                idx_x = int(next_rand(rng_state) * len_bx)
+            else:
+                idx_y = int(next_rand(rng_state) * len_by)
+        elif len_bx > 0:
+            idx_x = int(next_rand(rng_state) * len_bx)
+        elif len_by > 0:
+            idx_y = int(next_rand(rng_state) * len_by)
+        else: break
+
+        if idx_x != -1:
+            S = b2b_x_idx[idx_x]; Vrow = b2b_x_val[idx_x]
+        else:
+            S = b2b_y_idx[idx_y]; Vrow = b2b_y_val[idx_y]
+        k = 0
+        while k < S.shape[0] and S[k] != -1:
+            k += 1
+
+        net_moved[:] = False
+        old_partial_hpwl = 0.0
+        for a in range(k):
+            b = S[a]
+            for j in range(box_to_nets_mat.shape[1]):
+                nt = box_to_nets_mat[b, j]
+                if nt == -1: break
+                net_moved[nt] = True
+        for nt in range(num_nets):
+            if net_moved[nt]:
+                old_partial_hpwl += compute_single_net_hpwl(nt, X, Y, box_sizes_float, net_matrix)
+
+        old_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+
+        if idx_x != -1:
+            for a in range(k):
+                i = S[a]; X[i] += mult * Vrow[a]; x2[i] = X[i] + box_sizes_float[i, 0]
+        else:
+            for a in range(k):
+                i = S[a]; Y[i] += mult * Vrow[a]; y2[i] = Y[i] + box_sizes_float[i, 1]
+
+        new_partial_hpwl = 0.0
+        for nt in range(num_nets):
+            if net_moved[nt]:
+                new_partial_hpwl += compute_single_net_hpwl(nt, X, Y, box_sizes_float, net_matrix)
+        new_hpwl = current_hpwl + (new_partial_hpwl - old_partial_hpwl) * 5e-5
+
+        new_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+        new_box_ov = current_box_ov - old_touch + new_touch
+        area_new, inst_ov_new = inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                                              scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+        new_overlap = new_box_ov + inst_ov_new
+        new_cost = w_area * area_new + w_hpwl * new_hpwl + penalty_weight * (new_overlap * 1e-8)
+
+        accept = False
+        if new_overlap <= 0.0:
+            if current_overlap > 0.0 or new_cost < current_cost: accept = True
+            else:
+                dE = (new_cost - current_cost) / T
+                if dE < 70.0 and next_rand(rng_state) < np.exp(-dE): accept = True
+        else:
+            if new_overlap < current_overlap: accept = True
+            else:
+                dE = (new_cost - current_cost) / T
+                if dE < 70.0 and next_rand(rng_state) < np.exp(-dE): accept = True
+
+        if accept:
+            current_cost, current_overlap, current_hpwl = new_cost, new_overlap, new_hpwl
+            current_box_ov = new_box_ov
+            if current_overlap <= 0.0 and (best_overlap > 0.0 or current_cost < best_cost):
+                best_cost, best_overlap = current_cost, current_overlap
+                best_X[:] = X; best_Y[:] = Y
+            elif best_overlap > 0.0 and current_overlap < best_overlap:
+                best_cost, best_overlap = current_cost, current_overlap
+                best_X[:] = X; best_Y[:] = Y
+        else:
+            if idx_x != -1:
+                for a in range(k):
+                    i = S[a]; X[i] -= mult * Vrow[a]; x2[i] = X[i] + box_sizes_float[i, 0]
+            if idx_y != -1:
+                for a in range(k):
+                    i = S[a]; Y[i] -= mult * Vrow[a]; y2[i] = Y[i] + box_sizes_float[i, 1]
+
+    return X, Y, best_X, best_Y, best_cost, best_overlap
+
+# ==========================================
 # 3. Constraint parametrization helpers
 # ==========================================
 def parameterize_system(A, b, V):
@@ -481,12 +950,45 @@ def build_var_to_boxes(M):
         var_to_boxes_mat[v, :len(l)] = l
     return var_to_boxes_mat
 
+def build_var_to_boxes_vals(M):
+    """Like build_var_to_boxes but also returns the coefficient M[i,v] for each
+    (var, box) so the X update can be sparse: X[i] += delta * coeff[i]."""
+    if M.shape[1] == 0:
+        return np.zeros((0, 1), dtype=np.int32), np.zeros((0, 1), dtype=np.float64)
+    num_vars, num_free = M.shape
+    idx_list = [[] for _ in range(num_free)]
+    val_list = [[] for _ in range(num_free)]
+    for v in range(num_free):
+        for i in range(num_vars):
+            c = M[i, v]
+            if abs(c) > 1e-7:
+                idx_list[v].append(i)
+                val_list[v].append(c)
+    max_b = max((len(l) for l in idx_list), default=0)
+    if max_b == 0:
+        return np.full((num_free, 1), -1, dtype=np.int32), np.zeros((num_free, 1), dtype=np.float64)
+    idx_mat = np.full((num_free, max_b), -1, dtype=np.int32)
+    val_mat = np.zeros((num_free, max_b), dtype=np.float64)
+    for v in range(num_free):
+        idx_mat[v, :len(idx_list[v])] = idx_list[v]
+        val_mat[v, :len(val_list[v])] = val_list[v]
+    return idx_mat, val_mat
+
 # ==========================================
 # 4. Main Solver Class
 # ==========================================
 class Solution:
-    TIME_BUDGET = 119.0
+    TIME_BUDGET = 117.0
     SEED = 246813579
+    # ---- feature flags (optimization A/B) ----
+    USE_INCR_OVERLAP = True    # #1: incremental box-overlap + sparse X update (11.9x throughput on N=81)
+    USE_SPARSE_NETLIST = False # #6: net_moved as explicit small list (skip O(num_nets) scan)
+    RESTART_MULT = 2.0         # #2: multiplier on restart count (faster eval -> more restarts)
+    LARGE_N_MULT = 2.0         # #2: extra multiplier for N>60 (-> ~4x, CLAUDE.md sweet spot)
+    NET_AWARE_PROB = 0.25      # #3: net-aware move probability (cur_179 default)
+    NET_AWARE_MODE = 0         # #3: 0=random->centroid (kept; 1=extreme->median tested, no clear win)
+    FEAS_BACKSTOP = True       # #5: keep best overlap=0 legalized snapshot (never output invalid)
+    DIAG = False               # instrumentation off for ship
 
     def solve(self, data):
         start_time = time.time()
@@ -640,6 +1142,14 @@ class Solution:
         b2b_x = build_var_to_boxes(basis_x)
         b2b_y = build_var_to_boxes(basis_y)
 
+        # support-with-coefficients arrays for incremental/sparse cores (#1/#6)
+        v2b_x_idx, v2b_x_val = build_var_to_boxes_vals(M_x)
+        v2b_y_idx, v2b_y_val = build_var_to_boxes_vals(M_y)
+        b2b_x_idx, b2b_x_val = build_var_to_boxes_vals(basis_x)
+        b2b_y_idx, b2b_y_val = build_var_to_boxes_vals(basis_y)
+        in_box = np.zeros(N, dtype=np.int8)
+        use_incr = bool(self.USE_INCR_OVERLAP)
+
         avg_w = np.mean(box_sizes_float[:, 0]) if N > 0 else 0.0
         avg_h = np.mean(box_sizes_float[:, 1]) if N > 0 else 0.0
         base_step_p1 = float(max(avg_w, avg_h) * 4.0)
@@ -654,22 +1164,40 @@ class Solution:
         scratch_iy1 = np.zeros(num_inst, dtype=np.float64)
         scratch_iy2 = np.zeros(num_inst, dtype=np.float64)
         net_moved = np.zeros(len(nets), dtype=np.bool_)
+        na_scr = np.zeros(max(net_mat.shape[1], 1), dtype=np.float64)
+        na_prob = float(self.NET_AWARE_PROB)
+        na_mode = int(self.NET_AWARE_MODE)
 
-        # Fast JIT Warmup
+        # Fast JIT Warmup (compile only the cores that will actually run)
         cur_Zx_d = np.zeros(num_free_x, dtype=np.float64)
         cur_Zy_d = np.zeros(num_free_y, dtype=np.float64)
         rng_dummy = np.array([self.SEED], dtype=np.uint32)
-        _ = run_sa_steps_float(cur_Zx_d, cur_Zy_d, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
-                               v2b_x, v2b_y, box_to_nets_mat, box_to_zx, box_to_zy,
-                               scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
-                               1, 100.0, base_step_p1, rng_dummy, 1.0, 1.0, 10)
-        _ = run_integer_tuning_steps(C_x.copy(), C_y.copy(), basis_x, basis_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
-                                     b2b_x, b2b_y, box_to_nets_mat,
-                                     scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
-                                     rng_dummy, 1.0, 1.0, 20.0, 10)
+        if use_incr:
+            _ = run_sa_steps_float_incr(cur_Zx_d, cur_Zy_d, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                                        v2b_x_idx, v2b_x_val, v2b_y_idx, v2b_y_val, box_to_nets_mat, box_to_zx, box_to_zy,
+                                        scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved, in_box,
+                                        1, 100.0, base_step_p1, rng_dummy, 1.0, 1.0, 10, na_prob, na_mode, na_scr)
+            _ = run_integer_tuning_steps_incr(C_x.copy(), C_y.copy(), basis_x, basis_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                                              b2b_x_idx, b2b_x_val, b2b_y_idx, b2b_y_val, box_to_nets_mat,
+                                              scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved, in_box,
+                                              rng_dummy, 1.0, 1.0, 20.0, 10)
+        else:
+            _ = run_sa_steps_float(cur_Zx_d, cur_Zy_d, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                                   v2b_x, v2b_y, box_to_nets_mat, box_to_zx, box_to_zy,
+                                   scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
+                                   1, 100.0, base_step_p1, rng_dummy, 1.0, 1.0, 10)
+            _ = run_integer_tuning_steps(C_x.copy(), C_y.copy(), basis_x, basis_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                                         b2b_x, b2b_y, box_to_nets_mat,
+                                         scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
+                                         rng_dummy, 1.0, 1.0, 20.0, 10)
 
         constraint_ratio = (num_free_x + num_free_y) / (2.0 * N) if N > 0 else 1.0
         restart_time_target = 25.0 if constraint_ratio > 0.6 else 15.0
+        # optimization #2: lower per-restart target -> more restarts (only pays off
+        # when paired with the faster incremental eval, otherwise under-converges)
+        restart_time_target = restart_time_target / float(self.RESTART_MULT)
+        if N > 60:
+            restart_time_target = restart_time_target / float(self.LARGE_N_MULT)
         initial_available = self.TIME_BUDGET - (time.time() - start_time)
         n_restarts = max(1, int(initial_available / restart_time_target))
 
@@ -689,11 +1217,21 @@ class Solution:
         g_cost = np.inf
         g_overlap_best = np.inf
         g_X, g_Y = None, None
+        _diag = bool(getattr(self, "DIAG", False))
+        _d_p1 = _d_p2 = _d_tune = 0.0
+        _d_sa = 0
+        _d_nr = 0
+        if _diag:
+            _d_overhead = time.time() - start_time
+        # init so the no-restart fallback (g_X is None) is well-defined
+        cur_Zx = np.zeros(num_free_x, dtype=np.float64)
+        cur_Zy = np.zeros(num_free_y, dtype=np.float64)
 
         for r in range(n_restarts):
             current_time = time.time()
             time_left = start_time + self.TIME_BUDGET - current_time
             if time_left < 3.0: break
+            if _diag: _d_nr += 1
 
             current_restart_budget = time_left / (n_restarts - r)
             p1_duration = current_restart_budget * 0.45
@@ -722,16 +1260,25 @@ class Solution:
                 step_size = base_step_p1 * (1.0 - 0.95 * pct)
                 if step_size < 1.0: step_size = 1.0
 
-                cur_Zx, cur_Zy, bZx, bZy, bc, bov = run_sa_steps_float(
-                    cur_Zx, cur_Zy, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
-                    v2b_x, v2b_y, box_to_nets_mat, box_to_zx, box_to_zy,
-                    scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
-                    1, T, step_size, rng, p1_w_area, p1_w_hpwl, 200)
-                
+                if use_incr:
+                    cur_Zx, cur_Zy, bZx, bZy, bc, bov = run_sa_steps_float_incr(
+                        cur_Zx, cur_Zy, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                        v2b_x_idx, v2b_x_val, v2b_y_idx, v2b_y_val, box_to_nets_mat, box_to_zx, box_to_zy,
+                        scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved, in_box,
+                        1, T, step_size, rng, p1_w_area, p1_w_hpwl, 200, na_prob, na_mode, na_scr)
+                else:
+                    cur_Zx, cur_Zy, bZx, bZy, bc, bov = run_sa_steps_float(
+                        cur_Zx, cur_Zy, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                        v2b_x, v2b_y, box_to_nets_mat, box_to_zx, box_to_zy,
+                        scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
+                        1, T, step_size, rng, p1_w_area, p1_w_hpwl, 200)
+
                 if bov < best_ov_p1 or (abs(bov - best_ov_p1) < 1e-3 and bc < best_cost_p1):
                     best_ov_p1, best_cost_p1 = bov, bc
                     best_Zx_p1[:], best_Zy_p1[:] = bZx, bZy
+                if _diag: _d_sa += 1
             cur_Zx, cur_Zy = best_Zx_p1, best_Zy_p1
+            if _diag: _d_p1 += time.time() - p1_start
 
             # ---------- Phase 2 ----------
             p2_start = time.time()
@@ -749,24 +1296,51 @@ class Solution:
                 step_size = base_step_p2 * (1.0 - 0.95 * pct)
                 if step_size < 1.0: step_size = 1.0
 
-                cur_Zx, cur_Zy, bZx, bZy, bc, bov = run_sa_steps_float(
-                    cur_Zx, cur_Zy, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
-                    v2b_x, v2b_y, box_to_nets_mat, box_to_zx, box_to_zy,
-                    scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
-                    2, T, step_size, rng, p2_w_area, p2_w_hpwl, 200)
-                
+                if use_incr:
+                    cur_Zx, cur_Zy, bZx, bZy, bc, bov = run_sa_steps_float_incr(
+                        cur_Zx, cur_Zy, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                        v2b_x_idx, v2b_x_val, v2b_y_idx, v2b_y_val, box_to_nets_mat, box_to_zx, box_to_zy,
+                        scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved, in_box,
+                        2, T, step_size, rng, p2_w_area, p2_w_hpwl, 200, na_prob, na_mode, na_scr)
+                else:
+                    cur_Zx, cur_Zy, bZx, bZy, bc, bov = run_sa_steps_float(
+                        cur_Zx, cur_Zy, M_x, C_x, M_y, C_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                        v2b_x, v2b_y, box_to_nets_mat, box_to_zx, box_to_zy,
+                        scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
+                        2, T, step_size, rng, p2_w_area, p2_w_hpwl, 200)
+
                 if bov <= 0.0 and (best_ov_p2 > 0.0 or bc < best_cost_p2):
                     best_ov_p2, best_cost_p2 = bov, bc
                     best_Zx_p2[:], best_Zy_p2[:] = bZx, bZy
                 elif best_ov_p2 > 0.0 and bov < best_ov_p2:
                     best_ov_p2, best_cost_p2 = bov, bc
                     best_Zx_p2[:], best_Zy_p2[:] = bZx, bZy
+                if _diag: _d_sa += 1
             cur_Zx, cur_Zy = best_Zx_p2, best_Zy_p2
+            if _diag: _d_p2 += time.time() - p2_start
 
             X_float = M_x @ cur_Zx + C_x
             Y_float = M_y @ cur_Zy + C_y
             X_int = fix_integer_layout(Ax, bx, X_float)
             Y_int = fix_integer_layout(Ay, by, Y_float)
+
+            # optimization #5 (feasibility backstop): the legalized phase-2 snapshot
+            # may already be overlap-free even if integer tuning later fails to clear
+            # overlap -> capture it as a feasible candidate so output is never invalid.
+            if self.FEAS_BACKSTOP:
+                for _bi in range(N):
+                    scratch_x2[_bi] = X_int[_bi] + box_sizes_float[_bi, 0]
+                    scratch_y2[_bi] = Y_int[_bi] + box_sizes_float[_bi, 1]
+                _bo = full_box_overlap(X_int, Y_int, scratch_x2, scratch_y2, N)
+                _, _io = inst_and_area(X_int, Y_int, scratch_x2, scratch_y2, rep_units_arr, box_to_inst_arr,
+                                       scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+                if _bo + _io <= 0.0:
+                    _a, _ = inst_and_area(X_int, Y_int, scratch_x2, scratch_y2, rep_units_arr, box_to_inst_arr,
+                                          scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+                    _h = compute_all_hpwl(X_int, Y_int, box_sizes_float, net_mat)
+                    _c = _a + 10.0 * _h
+                    if g_overlap_best > 0.0 or _c < g_cost:
+                        g_cost = _c; g_X = X_int.copy(); g_Y = Y_int.copy(); g_overlap_best = 0.0
 
             # ---------- Integer tuning ----------
             tune_start = time.time()
@@ -780,18 +1354,26 @@ class Solution:
                 pct = min(elapsed / tune_duration, 1.0)
                 T_tune = 20.0 * (0.0001 ** pct)
 
-                X_int, Y_int, bX, bY, bc, bov = run_integer_tuning_steps(
-                    X_int, Y_int, basis_x, basis_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
-                    b2b_x, b2b_y, box_to_nets_mat,
-                    scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
-                    rng, p2_w_area, p2_w_hpwl, T_tune, 200)
-                
+                if use_incr:
+                    X_int, Y_int, bX, bY, bc, bov = run_integer_tuning_steps_incr(
+                        X_int, Y_int, basis_x, basis_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                        b2b_x_idx, b2b_x_val, b2b_y_idx, b2b_y_val, box_to_nets_mat,
+                        scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved, in_box,
+                        rng, p2_w_area, p2_w_hpwl, T_tune, 200)
+                else:
+                    X_int, Y_int, bX, bY, bc, bov = run_integer_tuning_steps(
+                        X_int, Y_int, basis_x, basis_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                        b2b_x, b2b_y, box_to_nets_mat,
+                        scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
+                        rng, p2_w_area, p2_w_hpwl, T_tune, 200)
+
                 if bov <= 0.0 and (best_ov_tune > 0.0 or bc < best_cost_tune):
                     best_ov_tune, best_cost_tune = bov, bc
                     best_X_tune[:], best_Y_tune[:] = bX, bY
                 elif best_ov_tune > 0.0 and bov < best_ov_tune:
                     best_ov_tune, best_cost_tune = bov, bc
                     best_X_tune[:], best_Y_tune[:] = bX, bY
+            if _diag: _d_tune += time.time() - tune_start
 
             if best_ov_tune <= 0.0:
                 if best_cost_tune < g_cost or g_overlap_best > 0.0:
@@ -809,4 +1391,11 @@ class Solution:
             g_X, g_Y = fix_integer_layout(Ax, bx, g_X), fix_integer_layout(Ay, by, g_Y)
 
         positions = [[round(g_X[i] / 10000.0, 4), round(g_Y[i] / 10000.0, 4)] for i in range(N)]
+        if _diag:
+            _sa_t = _d_p1 + _d_p2
+            import sys as _sys
+            print("[diag] N=%d ovh=%.1f restarts=%d p1=%.1f p2=%.1f tune=%.1f "
+                  "sa_calls=%d steps/s=%.0f" % (
+                      N, _d_overhead, _d_nr, _d_p1, _d_p2, _d_tune, _d_sa,
+                      _d_sa * 200.0 / max(_sa_t, 1e-9)), file=_sys.stderr, flush=True)
         return {"positions": positions}
