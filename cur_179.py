@@ -867,8 +867,151 @@ def run_integer_tuning_steps_incr(X, Y, basis_x, basis_y, box_sizes_float, net_m
     return X, Y, best_X, best_Y, best_cost, best_overlap
 
 # ==========================================
-# 3. Constraint parametrization helpers
+# 2c. Greedy best-improvement descent (idea #4 probe)
+# Systematic (not random) descent over integer basis moves on the TRUE objective
+# (area + 10*hpwl), feasibility-preserving (only accept overlap<=0). Best-
+# improvement: scan every (axis, basis, mult), apply the single best gain, repeat
+# to a local optimum. Moved-nets are collected into an explicit small list (no
+# O(num_nets) scan). Monotone non-worsening by construction.
 # ==========================================
+@njit
+def run_integer_greedy_descent(X, Y, basis_x, basis_y, box_sizes_float, net_matrix,
+                               repeat_units, box_to_inst,
+                               b2b_x_idx, b2b_x_val, b2b_y_idx, b2b_y_val, box_to_nets_mat,
+                               x2, y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2,
+                               moved_nets_list, in_box, mults_arr,
+                               w_area, w_hpwl, max_evals):
+    N = box_sizes_float.shape[0]
+    for i in range(N):
+        x2[i] = X[i] + box_sizes_float[i, 0]
+        y2[i] = Y[i] + box_sizes_float[i, 1]
+    box_ov = full_box_overlap(X, Y, x2, y2, N)
+    area_f, inst_ov = inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                                    scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+    current_overlap = box_ov + inst_ov
+    current_hpwl = compute_all_hpwl(X, Y, box_sizes_float, net_matrix)
+    current_cost = w_area * area_f + w_hpwl * current_hpwl
+    current_box_ov = box_ov
+    cost_before = current_cost
+    nms = moved_nets_list
+    len_bx = b2b_x_idx.shape[0]
+    len_by = b2b_y_idx.shape[0]
+    nmult = mults_arr.shape[0]
+    evals = 0
+
+    while evals < max_evals:
+        best_gain = 1e-9
+        best_axis = -1; best_j = -1; best_mult = 0
+        for axis in range(2):
+            n_basis = len_bx if axis == 0 else len_by
+            idx_mat = b2b_x_idx if axis == 0 else b2b_y_idx
+            val_mat = b2b_x_val if axis == 0 else b2b_y_val
+            for j in range(n_basis):
+                S = idx_mat[j]
+                Vrow = val_mat[j]
+                k = 0
+                while k < S.shape[0] and S[k] != -1:
+                    k += 1
+                if k == 0:
+                    continue
+                old_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+                n_moved = 0
+                for a in range(k):
+                    b = S[a]
+                    for jj in range(box_to_nets_mat.shape[1]):
+                        nt = box_to_nets_mat[b, jj]
+                        if nt == -1:
+                            break
+                        dup = 0
+                        for t in range(n_moved):
+                            if nms[t] == nt:
+                                dup = 1; break
+                        if dup == 0:
+                            nms[n_moved] = nt; n_moved += 1
+                old_ph = 0.0
+                for t in range(n_moved):
+                    old_ph += compute_single_net_hpwl(nms[t], X, Y, box_sizes_float, net_matrix)
+                for mi in range(nmult):
+                    mult = mults_arr[mi]
+                    for a in range(k):
+                        i = S[a]
+                        if axis == 0:
+                            X[i] += mult * Vrow[a]; x2[i] = X[i] + box_sizes_float[i, 0]
+                        else:
+                            Y[i] += mult * Vrow[a]; y2[i] = Y[i] + box_sizes_float[i, 1]
+                    new_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+                    new_box_ov = current_box_ov - old_touch + new_touch
+                    area_new, inst_ov_new = inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                                                          scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+                    new_overlap = new_box_ov + inst_ov_new
+                    new_ph = 0.0
+                    for t in range(n_moved):
+                        new_ph += compute_single_net_hpwl(nms[t], X, Y, box_sizes_float, net_matrix)
+                    # revert
+                    for a in range(k):
+                        i = S[a]
+                        if axis == 0:
+                            X[i] -= mult * Vrow[a]; x2[i] = X[i] + box_sizes_float[i, 0]
+                        else:
+                            Y[i] -= mult * Vrow[a]; y2[i] = Y[i] + box_sizes_float[i, 1]
+                    evals += 1
+                    if new_overlap <= 0.0:
+                        new_hpwl = current_hpwl + (new_ph - old_ph) * 5e-5
+                        new_cost = w_area * area_new + w_hpwl * new_hpwl
+                        gain = current_cost - new_cost
+                        if gain > best_gain:
+                            best_gain = gain; best_axis = axis; best_j = j; best_mult = mult
+                    if evals >= max_evals:
+                        break
+                if evals >= max_evals:
+                    break
+            if evals >= max_evals:
+                break
+        if best_axis == -1:
+            break
+        # commit best move
+        axis = best_axis; j = best_j; mult = best_mult
+        idx_mat = b2b_x_idx if axis == 0 else b2b_y_idx
+        val_mat = b2b_x_val if axis == 0 else b2b_y_val
+        S = idx_mat[j]; Vrow = val_mat[j]
+        k = 0
+        while k < S.shape[0] and S[k] != -1:
+            k += 1
+        old_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+        n_moved = 0
+        for a in range(k):
+            b = S[a]
+            for jj in range(box_to_nets_mat.shape[1]):
+                nt = box_to_nets_mat[b, jj]
+                if nt == -1:
+                    break
+                dup = 0
+                for t in range(n_moved):
+                    if nms[t] == nt:
+                        dup = 1; break
+                if dup == 0:
+                    nms[n_moved] = nt; n_moved += 1
+        old_ph = 0.0
+        for t in range(n_moved):
+            old_ph += compute_single_net_hpwl(nms[t], X, Y, box_sizes_float, net_matrix)
+        for a in range(k):
+            i = S[a]
+            if axis == 0:
+                X[i] += mult * Vrow[a]; x2[i] = X[i] + box_sizes_float[i, 0]
+            else:
+                Y[i] += mult * Vrow[a]; y2[i] = Y[i] + box_sizes_float[i, 1]
+        new_touch = touch_box_overlap(X, Y, x2, y2, N, S, k, in_box)
+        current_box_ov = current_box_ov - old_touch + new_touch
+        area_f, inst_ov = inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
+                                        scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2)
+        current_overlap = current_box_ov + inst_ov
+        new_ph = 0.0
+        for t in range(n_moved):
+            new_ph += compute_single_net_hpwl(nms[t], X, Y, box_sizes_float, net_matrix)
+        current_hpwl = current_hpwl + (new_ph - old_ph) * 5e-5
+        current_cost = w_area * area_f + w_hpwl * current_hpwl
+    return X, Y, current_cost, current_hpwl, current_overlap, cost_before
+
 def parameterize_system(A, b, V):
     if A.size == 0 or A.shape[0] == 0:
         return np.eye(V), np.zeros(V), V
@@ -988,6 +1131,8 @@ class Solution:
     NET_AWARE_PROB = 0.25      # #3: net-aware move probability (cur_179 default)
     NET_AWARE_MODE = 0         # #3: 0=random->centroid (kept; 1=extreme->median tested, no clear win)
     FEAS_BACKSTOP = True       # #5: keep best overlap=0 legalized snapshot (never output invalid)
+    USE_GREEDY_POLISH = False  # #4: greedy best-improvement descent polish (enable after probe shows gain)
+    GREEDY_PROBE = False       # measure greedy delta on final layout (non-invasive; prints to stderr)
     DIAG = False               # instrumentation off for ship
 
     def solve(self, data):
@@ -1167,6 +1312,10 @@ class Solution:
         na_scr = np.zeros(max(net_mat.shape[1], 1), dtype=np.float64)
         na_prob = float(self.NET_AWARE_PROB)
         na_mode = int(self.NET_AWARE_MODE)
+        moved_nets_list = np.zeros(max(len(nets), 1), dtype=np.int32)
+        mults_arr = np.array([1, -1, 2, -2, 3, -3], dtype=np.int64)
+        use_greedy = bool(self.USE_GREEDY_POLISH)
+        greedy_probe = bool(self.GREEDY_PROBE)
 
         # Fast JIT Warmup (compile only the cores that will actually run)
         cur_Zx_d = np.zeros(num_free_x, dtype=np.float64)
@@ -1205,7 +1354,7 @@ class Solution:
         p1_temp_start = 4000.0 * scale_N if constraint_ratio > 0.6 else 1800.0 * scale_N
         p2_temp_start = 30.0 * scale_N if constraint_ratio > 0.6 else 15.0 * scale_N
         p1_w_area, p1_w_hpwl = 0.1, 2.0
-        p2_w_area, p2_w_hpwl = 1.0, 10.0
+        p2_w_area, p2_w_hpwl = 1.0, 10.0  # true objective Area + 10*HPWL
 
         s = int(self.SEED) & 0xFFFFFFFF
         seeds = [s]
@@ -1391,6 +1540,26 @@ class Solution:
             g_X, g_Y = fix_integer_layout(Ax, bx, g_X), fix_integer_layout(Ay, by, g_Y)
 
         positions = [[round(g_X[i] / 10000.0, 4), round(g_Y[i] / 10000.0, 4)] for i in range(N)]
+        if use_greedy or greedy_probe:
+            # greedy best-improvement descent on the final feasible layout (#4).
+            # Non-worsening: only accepts overlap-free improving moves.
+            gX = g_X.copy(); gY = g_Y.copy()
+            max_evals = 200000
+            gX, gY, gc_after, gh_after, gov_after, gc_before = run_integer_greedy_descent(
+                gX, gY, basis_x, basis_y, box_sizes_float, net_mat, rep_units_arr, box_to_inst_arr,
+                b2b_x_idx, b2b_x_val, b2b_y_idx, b2b_y_val, box_to_nets_mat,
+                scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2,
+                moved_nets_list, in_box, mults_arr, 1.0, 10.0, max_evals)
+            if greedy_probe:
+                import sys as _sys2
+                rel = (gc_before - gc_after) / max(abs(gc_before), 1.0) * 100.0
+                print("[greedy-probe] N=%d cost %.1f -> %.1f (%.3f%%)  hpwl_after=%.2f  ov=%.4g" % (
+                    N, gc_before, gc_after, rel, gh_after, gov_after),
+                    file=_sys2.stderr, flush=True)
+            if use_greedy and gov_after <= 0.0 and gc_after < g_cost:
+                g_X, g_Y = gX, gY
+                g_cost = gc_after
+                positions = [[round(g_X[i] / 10000.0, 4), round(g_Y[i] / 10000.0, 4)] for i in range(N)]
         if _diag:
             _sa_t = _d_p1 + _d_p2
             import sys as _sys
