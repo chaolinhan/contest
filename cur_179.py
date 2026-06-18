@@ -248,7 +248,6 @@ def inst_and_area(X, Y, x2, y2, repeat_units, box_to_inst,
     area_f = (gmax_x - gmin_x) * (gmax_y - gmin_y) * 1e-8
     return area_f, overlap_val
 
-# ==========================================
 # 2. Stateful & Incremental SA Cores
 # ==========================================
 @njit
@@ -1131,6 +1130,8 @@ class Solution:
     NET_AWARE_PROB = 0.25      # #3: net-aware move probability (cur_179 default)
     NET_AWARE_MODE = 0         # #3: 0=random->centroid (kept; 1=extreme->median tested, no clear win)
     FEAS_BACKSTOP = True       # #5: keep best overlap=0 legalized snapshot (never output invalid)
+    USE_EARLY_ADVANCE = False  # advance to next restart when phase-2 stalls; tested NEUTRAL (RESTART_MULT already gives enough converged restarts)
+    STALL_LIMIT = 4            # consecutive non-improving phase-2 blocks before early-advance
     USE_GREEDY_POLISH = False  # #4: greedy best-improvement descent polish (enable after probe shows gain)
     GREEDY_PROBE = False       # measure greedy delta on final layout (non-invasive; prints to stderr)
     DIAG = False               # instrumentation off for ship
@@ -1357,11 +1358,16 @@ class Solution:
         p2_w_area, p2_w_hpwl = 1.0, 10.0  # true objective Area + 10*HPWL
 
         s = int(self.SEED) & 0xFFFFFFFF
+        # generate a large seed pool: with early-advance the actual restart count
+        # can exceed the nominal n_restarts, so make the pool ample.
+        n_seeds = max(n_restarts * 8, 256)
         seeds = [s]
-        for _ in range(n_restarts - 1):
+        for _ in range(n_seeds - 1):
             s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
             if s == 0: s = 2463534242
             seeds.append(s)
+        use_early = bool(self.USE_EARLY_ADVANCE) and (N <= 60)
+        stall_limit = int(self.STALL_LIMIT)
 
         g_cost = np.inf
         g_overlap_best = np.inf
@@ -1376,13 +1382,18 @@ class Solution:
         cur_Zx = np.zeros(num_free_x, dtype=np.float64)
         cur_Zy = np.zeros(num_free_y, dtype=np.float64)
 
-        for r in range(n_restarts):
+        r = 0
+        while True:
             current_time = time.time()
             time_left = start_time + self.TIME_BUDGET - current_time
             if time_left < 3.0: break
+            if r >= len(seeds): break
             if _diag: _d_nr += 1
 
-            current_restart_budget = time_left / (n_restarts - r)
+            # cap each restart at the per-restart target. For N>60 (no early-advance)
+            # this reproduces the equal-length fixed slices; for N<=60 a restart ends
+            # sooner once phase-2 stalls, packing more fully-converged restarts.
+            current_restart_budget = min(time_left, restart_time_target)
             p1_duration = current_restart_budget * 0.45
             p2_duration = current_restart_budget * 0.45
             tune_duration = current_restart_budget * 0.10
@@ -1437,6 +1448,7 @@ class Solution:
             best_Zy_p2 = cur_Zy.copy()
             best_cost_p2 = np.inf
             best_ov_p2 = np.inf
+            _p2_stall = 0
 
             while time.time() < p2_deadline:
                 elapsed = time.time() - p2_start
@@ -1458,13 +1470,25 @@ class Solution:
                         scratch_x2, scratch_y2, scratch_ix1, scratch_ix2, scratch_iy1, scratch_iy2, net_moved,
                         2, T, step_size, rng, p2_w_area, p2_w_hpwl, 200)
 
+                _p2_improved = False
                 if bov <= 0.0 and (best_ov_p2 > 0.0 or bc < best_cost_p2):
                     best_ov_p2, best_cost_p2 = bov, bc
                     best_Zx_p2[:], best_Zy_p2[:] = bZx, bZy
+                    _p2_improved = True
                 elif best_ov_p2 > 0.0 and bov < best_ov_p2:
                     best_ov_p2, best_cost_p2 = bov, bc
                     best_Zx_p2[:], best_Zy_p2[:] = bZx, bZy
+                    _p2_improved = True
                 if _diag: _d_sa += 1
+                # early-advance: once a feasible (overlap-free) layout is found and
+                # phase-2 stops improving it for STALL_LIMIT blocks, end this restart
+                # early so the time goes to a fresh seed (more converged restarts).
+                if _p2_improved:
+                    _p2_stall = 0
+                else:
+                    _p2_stall += 1
+                if use_early and best_ov_p2 <= 0.0 and _p2_stall >= stall_limit:
+                    break
             cur_Zx, cur_Zy = best_Zx_p2, best_Zy_p2
             if _diag: _d_p2 += time.time() - p2_start
 
@@ -1534,6 +1558,7 @@ class Solution:
                     g_cost = best_cost_tune
                     g_X, g_Y = best_X_tune.copy(), best_Y_tune.copy()
                     g_overlap_best = best_ov_tune
+            r += 1
 
         if g_X is None:
             g_X, g_Y = M_x @ cur_Zx + C_x, M_y @ cur_Zy + C_y
