@@ -1401,10 +1401,26 @@ class Solution:
             rng = np.array([seeds[r]], dtype=np.uint32)
             cur_Zx = np.zeros(num_free_x, dtype=np.float64)
             cur_Zy = np.zeros(num_free_y, dtype=np.float64)
-            for i in range(num_free_x): cur_Zx[i] = (next_rand(rng) - 0.5) * 400000.0
-            for i in range(num_free_y): cur_Zy[i] = (next_rand(rng) - 0.5) * 400000.0
+            _hint = getattr(self, "Z_HINT", None)
+            _hint_n = int(getattr(self, "Z_HINT_N", 1))
+            _hinted_restart = (_hint is not None and r < _hint_n)
+            if _hinted_restart:
+                # seed first _hint_n restarts from the hint (restart 0 exact, later
+                # ones lightly perturbed), rest random. Hint = seq-pair topology.
+                scale = 0.0 if r == 0 else 20000.0
+                for i in range(num_free_x): cur_Zx[i] = _hint[0][i] + (next_rand(rng) - 0.5) * scale
+                for i in range(num_free_y): cur_Zy[i] = _hint[1][i] + (next_rand(rng) - 0.5) * scale
+            else:
+                for i in range(num_free_x): cur_Zx[i] = (next_rand(rng) - 0.5) * 400000.0
+                for i in range(num_free_y): cur_Zy[i] = (next_rand(rng) - 0.5) * 400000.0
 
             # ---------- Phase 1 ----------
+            # NOTE: a topology-preserving (small-step) phase-1 for hinted restarts was
+            # tried and REJECTED — it cannot clear the large overlap that constraint
+            # projection creates (symmetry-heavy cases), yielding INVALID layouts.
+            # Large steps are required to clear projection overlap (they scatter the
+            # seq-pair topology, which is why the seq-pair hint is net-neutral).
+            p1_base = base_step_p1
             p1_start = time.time()
             p1_deadline = p1_start + p1_duration
             log_temp_ratio = np.log(1e-1 / p1_temp_start)
@@ -1417,7 +1433,7 @@ class Solution:
                 elapsed = time.time() - p1_start
                 pct = min(elapsed / p1_duration, 1.0)
                 T = p1_temp_start * np.exp(log_temp_ratio * pct)
-                step_size = base_step_p1 * (1.0 - 0.95 * pct)
+                step_size = p1_base * (1.0 - 0.95 * pct)
                 if step_size < 1.0: step_size = 1.0
 
                 if use_incr:
